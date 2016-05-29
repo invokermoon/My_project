@@ -58,12 +58,15 @@ module_param(funcs,charp,0644);
 #define QKRP_MAJOR	3333
 static int major = QKRP_MAJOR;
 static struct class *qkrp_class;
-uint32_t qattrs;
 extern unsigned long volatile jiffies;
 #define MAX_NUM 20
 static uint8_t index = 0;
 
-struct timespec pre_ts;
+/*attrs*/
+uint32_t qattrs;
+uint32_t memleaks;
+//uint32_t scan_start_addr;
+//uint32_t scan_end_addr;
 
 static struct qdev_s{
 	struct kprobe qkrp;
@@ -119,6 +122,45 @@ static int do_fault_handler(struct kprobe *p, struct pt_regs *regs, int trapnr)
 	printk(KERN_INFO"do fault done\n");
 	return 0;
 }
+
+static ssize_t show_memleaks(struct device *dev,
+				     struct device_attribute *attr,
+				     char *buf)
+{
+	return 0;
+}
+static DEVICE_ATTR(memleaks,S_IRUGO, show_memleaks, NULL);
+
+static ssize_t store_scan_start_addr(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf,
+				      size_t count)
+{
+	int ret = 0;
+	return ret;
+}
+
+static ssize_t store_scan_end_addr(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf,
+				      size_t count)
+{
+	int ret = 0;
+	return ret;
+}
+
+static DEVICE_ATTR(scan_end_addr,S_IWUSR, NULL, store_scan_end_addr);
+static DEVICE_ATTR(scan_start_addr, S_IWUSR, NULL, store_scan_start_addr);
+
+static struct attribute *dev_scan_attributes[] = {
+	&dev_attr_scan_start_addr.attr,
+	&dev_attr_scan_end_addr.attr,
+	NULL
+};
+
+static struct attribute_group dev_scan_addr_group= {
+	.attrs = dev_scan_attributes
+};
 
 static ssize_t show_qattrs(struct device *dev,
 				     struct device_attribute *attr,
@@ -214,7 +256,17 @@ static int __init qkrp_init(void)
 
 	ret = device_create_file(dev, &dev_attr_qattrs);
 	if(ret < 0){
-		printk(KERN_ERR"create file error\n");
+		printk(KERN_ERR"create qattrs file error\n");
+		goto err_exit_device;
+	}
+	ret = device_create_file(dev, &dev_attr_memleaks);
+	if(ret < 0){
+		printk(KERN_ERR"create memleaks file error\n");
+		goto err_exit_device;
+	}
+	ret = sysfs_create_group(&dev->kobj, &dev_scan_addr_group);
+	if(ret < 0){
+		printk(KERN_ERR"create scan group error\n");
 		goto err_exit_device;
 	}
 	printk(KERN_INFO"register kprobe qkrp done\n");
