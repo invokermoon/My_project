@@ -46,6 +46,7 @@ Copyright (c) 2015, Intel Corporation. All rights reserved.
 #include <linux/hrtimer.h>
 #include <linux/tick.h>
 #include <linux/times.h>
+#include <linux/vmalloc.h>
 
 
 MODULE_LICENSE("GPL");
@@ -56,20 +57,20 @@ static char *funcs = "test";
 module_param(funcs,charp,0644);
 
 #define QKRP_MAJOR	3333
+#define MAX_NUM 20
 static int major = QKRP_MAJOR;
 static struct class *qkrp_class;
 extern unsigned long volatile jiffies;
-#define MAX_NUM 20
 static uint8_t index = 0;
+int this_cpu;
 
 /*attrs*/
 uint32_t qattrs;
 uint32_t memleaks;
-//uint32_t scan_start_addr;
-//uint32_t scan_end_addr;
 
 static struct qdev_s{
 	struct kprobe qkrp;
+	struct kprobe qkmp;
 	int id;
 	unsigned long cnt;
 	unsigned long avr_duration;
@@ -82,10 +83,148 @@ static struct qdev_s{
 	char name[10];
 } qdev[MAX_NUM];
 
-int this_cpu;
+#if 0
+/*Below parameters is about memleak*/
+/* the list of all allocated objects */
+static LIST_HEAD(object_list);
+/* the list of gray-colored objects (see color_gray comment below) */
+static LIST_HEAD(gray_list);
+/* search tree for object boundaries */
+static struct rb_root object_tree_root = RB_ROOT;
+/* rw_lock protecting the access to object_list and object_tree_root */
+static DEFINE_RWLOCK(kmemleak_lock);
+
+/*
+ * Scan a memory block (exclusive range) for valid pointers and add those
+ * found to the gray list.
+ */
+static void scan_block(void *_start, void *_end,
+		       struct kmemleak_object *scanned)
+{
+	unsigned long *ptr;
+	unsigned long *start = PTR_ALIGN(_start, BYTES_PER_POINTER);
+	unsigned long *end = _end - (BYTES_PER_POINTER - 1);
+	unsigned long flags;
+
+	read_lock_irqsave(&kmemleak_lock, flags);
+	for (ptr = start; ptr < end; ptr++) {
+		struct kmemleak_object *object;
+		unsigned long pointer;
+
+		if (scan_should_stop())
+			break;
+
+		/* don't scan uninitialized memory */
+		if (!kmemcheck_is_obj_initialized((unsigned long)ptr,
+						  BYTES_PER_POINTER))
+			continue;
+
+		kasan_disable_current();
+		pointer = *ptr;
+		kasan_enable_current();
+
+		if (pointer < min_addr || pointer >= max_addr)
+			continue;
+
+		/*
+		 * No need for get_object() here since we hold kmemleak_lock.
+		 * object->use_count cannot be dropped to 0 while the object
+		 * is still present in object_tree_root and object_list
+		 * (with updates protected by kmemleak_lock).
+		 */
+		object = lookup_object(pointer, 1);
+		if (!object)
+			continue;
+		if (object == scanned)
+			/* self referenced, ignore */
+			continue;
+
+		/*
+		 * Avoid the lockdep recursive warning on object->lock being
+		 * previously acquired in scan_object(). These locks are
+		 * enclosed by scan_mutex.
+		 */
+		spin_lock_nested(&object->lock, SINGLE_DEPTH_NESTING);
+		if (!color_white(object)) {
+			/* non-orphan, ignored or new */
+			spin_unlock(&object->lock);
+			continue;
+		}
+
+		/*
+		 * Increase the object's reference count (number of pointers
+		 * to the memory block). If this count reaches the required
+		 * minimum, the object's color will become gray and it will be
+		 * added to the gray_list.
+		 */
+		object->count++;
+		if (color_gray(object)) {
+			/* put_object() called when removing from gray_list */
+			WARN_ON(!get_object(object));
+			list_add_tail(&object->gray_list, &gray_list);
+		}
+		spin_unlock(&object->lock);
+	}
+	read_unlock_irqrestore(&kmemleak_lock, flags);
+}
+
+/*
+ * Scan a large memory block in MAX_SCAN_SIZE chunks to reduce the latency.
+ */
+static void scan_large_block(void *start, void *end)
+{
+	void *next;
+
+	while (start < end) {
+		next = min(start + MAX_SCAN_SIZE, end);
+		scan_block(start, next, NULL);
+		start = next;
+		cond_resched();
+	}
+}
+#endif
+
+static int do_pre_vfree(struct kprobe *p, struct pt_regs *regs)
+{
+	printk(KERN_INFO"[pre]:pid:%d|comm:%10s,reg->di=%lu\n",current->pid, current->comm, regs->di);
+	return 0;
+}
+
+static void do_post_vfree(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
+{
+	printk(KERN_INFO"[post]:pid:%d|comm:%10s,reg->di=%lu\n",current->pid, current->comm, regs->di);
+}
+static int do_fault_vfree(struct kprobe *p, struct pt_regs *regs, int trapnr)
+{
+	printk(KERN_INFO"do vfree fault done\n");
+	return 0;
+}
+
+static int do_pre_vmalloc(struct kprobe *p, struct pt_regs *regs)
+{
+	printk(KERN_INFO"[pre]:pid:%d|comm:%10s,reg->di=%lu\n",current->pid, current->comm, regs->di);
+	return 0;
+}
+
+static void do_post_vmalloc(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
+{
+	printk(KERN_INFO"[post]:pid:%d|comm:%10s,reg->di=%lu,addr=0x%x\n",current->pid, current->comm, regs->di,p->addr);
+	printk(KERN_INFO"[post]:reg->bp=0x%x\n",regs->bp);
+	printk(KERN_INFO"[post]:reg->bx=0x%x\n",regs->bx);
+	printk(KERN_INFO"[post]:reg->si=0x%x\n",regs->si);
+	printk(KERN_INFO"[post]:reg->ax=0x%x\n",regs->ax);
+	printk(KERN_INFO"[post]:reg->dx=0x%x\n",regs->ax);
+}
+static int do_fault_vmalloc(struct kprobe *p, struct pt_regs *regs, int trapnr)
+{
+	printk(KERN_INFO"do vmalloc fault done\n");
+	return 0;
+}
+
 static int do_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 	int i = 0;
+	//printk(KERN_INFO"[pre]:pid:%d|comm:%10s,reg->di=0x%x\n",current->pid, current->comm, regs->di);
 	for(i=0;i<index;i++){
 		if(p->addr == qdev[i].qkrp.addr){
 				this_cpu = raw_smp_processor_id();
@@ -99,6 +238,7 @@ static int do_pre_handler(struct kprobe *p, struct pt_regs *regs)
 static void do_post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
 {
 	int i = 0;
+	//printk(KERN_INFO"[post]:pid:%d|comm:%10s,reg->di=0x%x\n",current->pid, current->comm, regs->di);
 	for(i=0;i<index;i++){
 		if(p->addr == qdev[i].qkrp.addr){
 			qdev[i].cnt++;
@@ -233,6 +373,36 @@ static int __init qkrp_init(void)
 		}
 		index++;
 	}
+/*register the kmp*/
+	qdev[0].qkmp.addr = (kprobe_opcode_t *)kallsyms_lookup_name("vmalloc");
+	if(qdev[0].qkmp.addr == NULL) {
+		printk(KERN_ERR"Vmalloc kprobe failed\n");
+		goto err_exit;
+	}
+	qdev[0].qkmp.pre_handler = do_pre_vmalloc;
+	qdev[0].qkmp.post_handler= do_post_vmalloc;
+	qdev[0].qkmp.fault_handler= do_fault_vmalloc;
+
+	qdev[1].qkmp.addr = (kprobe_opcode_t *)kallsyms_lookup_name("vfree");
+	if(qdev[1].qkmp.addr == NULL) {
+		printk(KERN_ERR"Vfree kprobe failed\n");
+		goto err_exit;
+	}
+	qdev[1].qkmp.pre_handler = do_pre_vfree;
+	qdev[1].qkmp.post_handler= do_post_vfree;
+	qdev[1].qkmp.fault_handler= do_fault_vfree;
+
+	ret = register_kprobe(&(qdev[0].qkmp));
+	if( ret < 0 ){
+		printk(KERN_ERR"register kprobe malloc error\n");
+		goto err_exit;
+	}
+
+	ret = register_kprobe(&(qdev[1].qkmp));
+	if( ret < 0 ){
+		printk(KERN_ERR"register kprobe vfree error\n");
+		goto err_exit;
+	}
 
 	kfree(bak_p);
 
@@ -269,6 +439,12 @@ static int __init qkrp_init(void)
 		printk(KERN_ERR"create scan group error\n");
 		goto err_exit_device;
 	}
+
+/*ADD test code*/
+	char *p = vmalloc(10);
+	char *p1 = vmalloc(20);
+	char *p2 = vmalloc(30);
+	printk(KERN_INFO"p=0x%p,p1=0x%p,p2=0x%p\n",p,p1,p2);
 	printk(KERN_INFO"register kprobe qkrp done\n");
 	return 0;
 err_exit_device:
