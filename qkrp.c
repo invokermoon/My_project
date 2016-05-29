@@ -127,7 +127,7 @@ static ssize_t show_qattrs(struct device *dev,
  	int i = 0;
 	int ret = 0;
 	if(!index)
-		return scnprintf(buf, PAGE_SIZE, "Please input right func\n");
+		return scnprintf(buf, PAGE_SIZE, "Please input right func,when you insmod\n");
 	for(i=0; i<index;i++){
 		ret +=scnprintf(buf+ret, PAGE_SIZE-ret, "%s:%lu<ns>:%lu<cnt>\n",qdev[i].name,
 																	qdev[i].avr_duration,
@@ -161,6 +161,7 @@ static int __init qkrp_init(void)
 	struct device *dev;
 	char *func_name=NULL;
 	char *funcs_name = kstrdup(funcs, GFP_KERNEL);
+	char *bak_p= funcs_name;
 	while(funcs_name && !strncmp("sys", funcs_name, 3)){
 		func_name = strsep(&funcs_name, ",");
 		if(!strncmp("sys", func_name, 3)){
@@ -190,6 +191,8 @@ static int __init qkrp_init(void)
 		}
 		index++;
 	}
+
+	kfree(bak_p);
 
 	major= register_chrdev(0, "qkrp", &qkrp_device_fops);
 	if (major < 0) {

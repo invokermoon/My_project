@@ -1,0 +1,34 @@
+Q:How to compile:
+A:2 ways
+	(option 1):make
+	(option 2):./build -c
+
+Q:How to run:
+A:
+	./build -i sys_XXX,sys_XXX,sys_XXX
+eg:
+	./build -i sys_clone,sys_write
+
+Running result:
+	It will auto open a terminal that can caputure the log of dmesg
+	when you tapping:
+		cat  /sys/class/qkrp/qkrp/qattrs
+	and you will the following log
+
+ui@sherlock:~/workspace/my_project/queexe/hello$ cat /sys/class/qkrp/qkrp/qattrs 
+sys_clone:167<ns>:172<cnt>
+sys_getpid:213<ns>:5<cnt>
+hui@sherlock:~/workspace/my_project/queexe/hello$ cat /sys/class/qkrp/qkrp/qattrs 
+sys_clone:167<ns>:173<cnt>
+sys_getpid:213<ns>:5<cnt>
+hui@sherlock:~/workspace/my_project/queexe/hello$ cat /sys/class/qkrp/qkrp/qattrs 
+sys_clone:167<ns>:174<cnt>
+sys_getpid:213<ns>:5<cnt>
+hui@sherlock:~/workspace/my_project/queexe/hello$ cat /sys/class/qkrp/qkrp/qattrs 
+sys_clone:168<ns>:175<cnt>
+sys_getpid:213<ns>:5<cnt>
+
+
+Q:How to rmmod this moudle
+A:
+		./build -r
