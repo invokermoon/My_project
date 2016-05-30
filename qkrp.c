@@ -36,18 +36,45 @@ Copyright (c) 2015, Intel Corporation. All rights reserved.
 #include <linux/init.h>
 #include <linux/list.h>
 #include <linux/poll.h>
-#include <linux/spinlock.h>
 #include <linux/rwsem.h>
 #include <linux/stddef.h>
 #include <linux/device.h>
-#include <linux/mutex.h>
-#include <linux/slab.h>
 
 #include <linux/hrtimer.h>
 #include <linux/tick.h>
 #include <linux/times.h>
 #include <linux/vmalloc.h>
 
+#include <linux/delay.h>
+#include <linux/export.h>
+#include <linux/kthread.h>
+#include <linux/rbtree.h>
+#include <linux/fs.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/cpumask.h>
+#include <linux/spinlock.h>
+#include <linux/mutex.h>
+#include <linux/rcupdate.h>
+#include <linux/stacktrace.h>
+#include <linux/cache.h>
+#include <linux/percpu.h>
+#include <linux/hardirq.h>
+#include <linux/mmzone.h>
+#include <linux/slab.h>
+#include <linux/thread_info.h>
+#include <linux/err.h>
+#include <linux/string.h>
+#include <linux/nodemask.h>
+#include <linux/mm.h>
+#include <linux/workqueue.h>
+
+#include <asm/sections.h>
+#include <asm/processor.h>
+#include <linux/atomic.h>
+
+#include <linux/kasan.h>
+#include <linux/kmemcheck.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("hui");
@@ -69,6 +96,32 @@ uint32_t qattrs;
 uint32_t memleaks;
 
 /*Below parameters is about memleak*/
+#define MAX_TRACE		16	/* stack trace length */
+#define MAX_SCAN_SIZE		4096	/* maximum size of a scanned block */
+
+/* flag representing the memory block allocation status */
+#define OBJECT_ALLOCATED	(1 << 0)
+/* flag set after the first reporting of an unreference object */
+#define OBJECT_REPORTED		(1 << 1)
+/* flag set to not scan the object */
+#define OBJECT_NO_SCAN		(1 << 2)
+
+/* GFP bitmask for qkmp internal allocations */
+#define gfp_qkmp_mask(gfp)	(((gfp) & (GFP_KERNEL | GFP_ATOMIC | \
+					   __GFP_NOACCOUNT)) | \
+				 __GFP_NORETRY | __GFP_NOMEMALLOC | \
+				 __GFP_NOWARN)
+
+#define qkmp_stop(x...)	do {	\
+	qkmp_disable();		\
+} while (0)
+
+/* set if tracing memory operations is enabled */
+static int qkmp_enabled;
+/* allocation caches for qkmp internal data */
+static struct kmem_cache *object_cache;
+uint32_t malloc_size = 0;
+
 /* minimum and maximum address that may be valid pointers */
 static unsigned long min_addr = ULONG_MAX;
 static unsigned long max_addr;
@@ -79,7 +132,8 @@ static LIST_HEAD(gray_list);
 /* search tree for object boundaries */
 static struct rb_root object_tree_root = RB_ROOT;
 /* rw_lock protecting the access to object_list and object_tree_root */
-static DEFINE_RWLOCK(kmemleak_lock);
+static DEFINE_RWLOCK(qkmp_lock);
+#define BYTES_PER_POINTER	sizeof(void *)
 
 static struct qkrp_dev_s{
 	struct kprobe qkrp;
@@ -121,8 +175,119 @@ struct qkmp_object{
 	char comm[TASK_COMM_LEN];	/* executable name */
 };
 
+#define QKMP_GREY	0
+#define QKMP_BLACK	-1
+
+/*
+ * Object colors, encoded with count and min_count:
+ * - white - orphan object, not enough references to it (count < min_count)
+ * - gray  - not orphan, not marked as false positive (min_count == 0) or
+ *		sufficient references to it (count >= min_count)
+ * - black - ignore, it doesn't contain references (e.g. text section)
+ *		(min_count == -1). No function defined for this color.
+ * Newly created objects don't have any color assigned (object->count == -1)
+ * before the next memory scan when they become white.
+ */
+static bool color_white(const struct qkmp_object *object)
+{
+	return object->count != QKMP_BLACK &&
+		object->count < object->min_count;
+}
+
+static bool color_gray(const struct qkmp_object *object)
+{
+	return object->min_count != QKMP_BLACK &&
+		object->count >= object->min_count;
+}
+
+/*
+ * Printing of the unreferenced objects information to the seq file. The
+ * print_unreferenced function must be called with the object->lock held.
+ */
+static void print_unreferenced(struct seq_file *seq,
+			       struct qkmp_object *object)
+{
+	int i;
+	unsigned int msecs_age = jiffies_to_msecs(jiffies - object->jiffies);
+
+	seq_printf(seq, "unreferenced object 0x%08lx (size %zu):\n",
+		   object->pointer, object->size);
+	seq_printf(seq, "  comm \"%s\", pid %d, jiffies %lu (age %d.%03ds)\n",
+		   object->comm, object->pid, object->jiffies,
+		   msecs_age / 1000, msecs_age % 1000);
+	//hex_dump_object(seq, object);
+	seq_printf(seq, "  backtrace:\n");
+
+	for (i = 0; i < object->trace_len; i++) {
+		void *ptr = (void *)object->trace[i];
+		seq_printf(seq, "    [<%p>] %pS\n", ptr, ptr);
+	}
+}
 
 #if 0
+/*
+ * Objects are considered unreferenced only if their color is white, they have
+ * not be deleted and have a minimum age to avoid false positives caused by
+ * pointers temporarily stored in CPU registers.
+ */
+static bool unreferenced_object(struct qkmp_object *object)
+{
+	return (color_white(object) && object->flags & OBJECT_ALLOCATED) &&
+		time_before_eq(object->jiffies + jiffies_min_age,
+			       jiffies_last_scan);
+}
+#endif
+
+/*
+ * Save stack trace to the given array of MAX_TRACE size.
+ */
+static int __save_stack_trace(unsigned long *trace)
+{
+	struct stack_trace stack_trace;
+
+	stack_trace.max_entries = MAX_TRACE;
+	stack_trace.nr_entries = 0;
+	stack_trace.entries = trace;
+	stack_trace.skip = 2;
+	save_stack_trace(&stack_trace);
+	return stack_trace.nr_entries;
+}
+
+/*
+ * Look-up a memory block metadata (qkmp_object) in the object search
+ * tree based on a pointer value. If alias is 0, only values pointing to the
+ * beginning of the memory block are allowed. The qkmp_lock must be held
+ * when calling this function.
+ */
+static struct qkmp_object *lookup_object(unsigned long ptr, int alias)
+{
+	struct rb_node *rb = object_tree_root.rb_node;
+
+	while (rb) {
+		struct qkmp_object *object =
+			rb_entry(rb, struct qkmp_object, rb_node);
+		if (ptr < object->pointer)
+			rb = object->rb_node.rb_left;
+		else if (object->pointer + object->size <= ptr)
+			rb = object->rb_node.rb_right;
+		else if (object->pointer == ptr || alias)
+			return object;
+		else {
+			printk(KERN_INFO"Found object by alias at 0x%08lx\n",
+				      ptr);
+			break;
+		}
+	}
+	return NULL;
+}
+
+static int scan_should_stop(void)
+{
+	if (!qkmp_enabled)
+		return 1;
+	return 0;
+}
+
 /*
  * Scan a memory block (exclusive range) for valid pointers and add those
  * found to the gray list.
@@ -135,7 +300,7 @@ static void scan_block(void *_start, void *_end,
 	unsigned long *end = _end - (BYTES_PER_POINTER - 1);
 	unsigned long flags;
 
-	read_lock_irqsave(&kmemleak_lock, flags);
+	read_lock_irqsave(&qkmp_lock, flags);
 	for (ptr = start; ptr < end; ptr++) {
 		struct qkmp_object *object;
 		unsigned long pointer;
@@ -143,10 +308,12 @@ static void scan_block(void *_start, void *_end,
 		if (scan_should_stop())
 			break;
 
+#if 0
 		/* don't scan uninitialized memory */
 		if (!kmemcheck_is_obj_initialized((unsigned long)ptr,
 						  BYTES_PER_POINTER))
 			continue;
+#endif
 
 		kasan_disable_current();
 		pointer = *ptr;
@@ -156,10 +323,10 @@ static void scan_block(void *_start, void *_end,
 			continue;
 
 		/*
-		 * No need for get_object() here since we hold kmemleak_lock.
+		 * No need for get_object() here since we hold qkmp_lock.
 		 * object->use_count cannot be dropped to 0 while the object
 		 * is still present in object_tree_root and object_list
-		 * (with updates protected by kmemleak_lock).
+		 * (with updates protected by qkmp_lock).
 		 */
 		object = lookup_object(pointer, 1);
 		if (!object)
@@ -189,12 +356,12 @@ static void scan_block(void *_start, void *_end,
 		object->count++;
 		if (color_gray(object)) {
 			/* put_object() called when removing from gray_list */
-			WARN_ON(!get_object(object));
+			//WARN_ON(!get_object(object));
 			list_add_tail(&object->gray_list, &gray_list);
 		}
 		spin_unlock(&object->lock);
 	}
-	read_unlock_irqrestore(&kmemleak_lock, flags);
+	read_unlock_irqrestore(&qkmp_lock, flags);
 }
 
 /*
@@ -211,7 +378,13 @@ static void scan_large_block(void *start, void *end)
 		cond_resched();
 	}
 }
-#endif
+
+static void qkmp_disable(void)
+{
+	/* stop any memory operation tracing */
+	qkmp_enabled = 0;
+	pr_info("Kernel memory leak detector disabled\n");
+}
 
 static struct qkmp_object *create_object(unsigned long ptr, size_t size,
 					     int min_count, gfp_t gfp)
@@ -220,10 +393,10 @@ static struct qkmp_object *create_object(unsigned long ptr, size_t size,
 	struct qkmp_object *object, *parent;
 	struct rb_node **link, *rb_parent;
 
-	object = kmem_cache_alloc(object_cache, gfp_kmemleak_mask(gfp));
+	object = kmem_cache_alloc(object_cache, gfp_qkmp_mask(gfp));
 	if (!object) {
 		pr_warning("Cannot allocate a qkmp_object structure\n");
-		kmemleak_disable();
+		qkmp_disable();
 		return NULL;
 	}
 
@@ -261,10 +434,12 @@ static struct qkmp_object *create_object(unsigned long ptr, size_t size,
 	/* kernel backtrace */
 	object->trace_len = __save_stack_trace(object->trace);
 
-	write_lock_irqsave(&kmemleak_lock, flags);
-
+	write_lock_irqsave(&qkmp_lock, flags);
+	/*These 2 variable is for update the scope when we want to scan the address.
+	 * If out of the scope, we can discard it very fast.*/
 	min_addr = min(min_addr, ptr);
 	max_addr = max(max_addr, ptr + size);
+
 	link = &object_tree_root.rb_node;
 	rb_parent = NULL;
 	while (*link) {
@@ -275,14 +450,13 @@ static struct qkmp_object *create_object(unsigned long ptr, size_t size,
 		else if (parent->pointer + parent->size <= ptr)
 			link = &parent->rb_node.rb_right;
 		else {
-			kmemleak_stop("Cannot insert 0x%lx into the object "
+			qkmp_stop("Cannot insert 0x%lx into the object "
 				      "search tree (overlaps existing)\n",
 				      ptr);
 			/*
 			 * No need for parent->lock here since "parent" cannot
-			 * be freed while the kmemleak_lock is held.
+			 * be freed while the qkmp_lock is held.
 			 */
-			dump_object_info(parent);
 			kmem_cache_free(object_cache, object);
 			object = NULL;
 			goto out;
@@ -293,12 +467,11 @@ static struct qkmp_object *create_object(unsigned long ptr, size_t size,
 
 	list_add_tail_rcu(&object->object_list, &object_list);
 out:
-	write_unlock_irqrestore(&kmemleak_lock, flags);
+	write_unlock_irqrestore(&qkmp_lock, flags);
 	return object;
 }
 
-
-
+#ifdef TEST/*{{{*/
 static int test_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	int i = 0;
@@ -329,18 +502,20 @@ struct kprobe test_qkmp = {
 	.post_handler= test_post,
 	.fault_handler= test_fault,
 };
+#endif /*TEST*//*}}}*/
 
 static int do_ret_vfree(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	//printk(KERN_INFO"[post]:pid:%d|comm:%10s,reg->di=%lu\n",current->pid, current->comm, regs->di);
 	return 0;
 }
+
 static int do_entry_vmalloc(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	/*parameter of vmalloc is DI */
 	printk(KERN_INFO"[entry]:pid:%d|comm:%10s,reg->di=%lu\n",current->pid, current->comm, regs->di);
-	size = (uint32_t *)(regs->di);
-	if (size){
+	malloc_size = (uint32_t)(regs->di);
+	if (malloc_size){
 		return 0;
 	}
 	return 1;
@@ -349,13 +524,15 @@ static int do_entry_vmalloc(struct kretprobe_instance *ri, struct pt_regs *regs)
 static int do_ret_vmalloc(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	/*ret of vmalloc is ax */
+	unsigned long long *ptr;
 	//printk(KERN_INFO"[ret]:pid:%d|comm:%10s,reg->di=%lu\n",current->pid, current->comm, regs->di);
 	printk(KERN_INFO"[ret]:reg->ax=0x%lx\n",regs->ax);
 	printk(KERN_INFO"[ret]:reg->di=0x%lx\n",regs->di);
 	printk(KERN_INFO"[ret]:reg->dx=0x%lx\n",regs->dx);
-	unsigned long long *ptr= regs->ax;
+	ptr = (unsigned long long *)(regs->ax);
 	if ( ptr && !IS_ERR(ptr)){
-		create_object((unsigned long)ptr, size, min_count);
+		//FIXME
+		create_object((unsigned long)ptr, malloc_size, 10, GFP_KERNEL);
 	}
 	return 0;
 }
@@ -425,6 +602,7 @@ static ssize_t store_scan_start_addr(struct device *dev,
 				      size_t count)
 {
 	int ret = 0;
+//	scan_large_block(void *start, void *end)
 	return ret;
 }
 
