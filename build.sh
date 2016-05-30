@@ -29,7 +29,7 @@ do
 			;;
 		i)
 			echo "login as root,input the passwd"
-			sudo gnome-terminal --title "LOG_OUTPUT" -x bash -c "tail -f /var/log/kern.log; exec bash;"
+			#sudo gnome-terminal --title "LOG_OUTPUT" -x bash -c "tail -f /var/log/kern.log; exec bash;"
 			funcs_en=1;
 			shift;
 			;;
@@ -46,8 +46,10 @@ done
 
 if [ $funcs_en -eq 1 ]; then
 	sudo rmmod qkrp >/dev/null 2>&1
+	dmesg -C
 	sleep 1
 	echo "Insmoding...$*"
 	sudo insmod $out_dir/qkrp.ko funcs=$*
+	dmesg
 fi
 
