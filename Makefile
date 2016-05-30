@@ -1,7 +1,7 @@
 KVER = $(shell uname -r)
 out_dir=$(PWD)/out
 
-obj-m :=qkrp.o
+obj-m :=qeexo.o
 
 .PHONY : all clean kernel_modules
 
